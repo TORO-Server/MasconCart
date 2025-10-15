@@ -1,5 +1,9 @@
 name: MasconCart
 main: prj.salmon.masconcart.MasconCart
-version: 1.1
+version: 1.2
 api-version: 1.20
 depend: [Train_Carts, ProtocolLib]
+commands:
+  mascon:
+    description: Mascon機能を有効/無効にします
+    usage: /mascon <on|off>

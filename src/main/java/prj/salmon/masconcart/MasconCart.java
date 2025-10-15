@@ -37,6 +37,8 @@ public class MasconCart extends JavaPlugin implements Listener {
     private static final double STOP_THRESHOLD_SPEED = 0.05;
 
     private ProtocolManager protocolManager;
+    private final Map<UUID, Boolean> masconDisabled = new HashMap<>();
+
     private final Map<UUID, Boolean> masconMode = new HashMap<>();
     private final Map<UUID, Integer> notchLevel = new HashMap<>();
     private final Map<UUID, Double> currentSpeed = new HashMap<>();
@@ -65,6 +67,47 @@ public class MasconCart extends JavaPlugin implements Listener {
         Bukkit.getPluginManager().registerEvents(this, this);
         updateTask = Bukkit.getScheduler().runTaskTimer(this, this::tickUpdate, 0L, TICK_INTERVAL);
         getLogger().info("MasconCart enabled (prj.salmon.masconcart)");
+
+        saveDefaultConfig();
+        for (String uuidStr : getConfig().getStringList("disabledPlayers")) {
+            try {
+                masconDisabled.put(UUID.fromString(uuidStr), true);
+            } catch (IllegalArgumentException ignored) {}
+        }
+
+        getCommand("mascon").setExecutor((sender, command, label, args) -> {
+            if (!(sender instanceof Player p)) {
+                sender.sendMessage("プレイヤーのみ使用できます");
+                return true;
+            }
+            UUID id = p.getUniqueId();
+            if (args.length == 0) {
+                p.sendMessage("§e/mascon on §fまたは §e/mascon off");
+                return true;
+            }
+            if (args[0].equalsIgnoreCase("off")) {
+                masconDisabled.put(id, true);
+                updateConfigDisabledList();
+                p.sendMessage("§c[Mascon] このプレイヤーではMascon機能を無効化しました");
+            } else if (args[0].equalsIgnoreCase("on")) {
+                masconDisabled.remove(id);
+                updateConfigDisabledList();
+                p.sendMessage("§a[Mascon] Mascon機能を有効化しました");
+            } else {
+                p.sendMessage("§e使用方法: /mascon on | off");
+            }
+            return true;
+        });
+
+    }
+
+    private void updateConfigDisabledList() {
+        java.util.List<String> list = new java.util.ArrayList<>();
+        for (UUID uuid : masconDisabled.keySet()) {
+            list.add(uuid.toString());
+        }
+        getConfig().set("disabledPlayers", list);
+        saveConfig();
     }
 
     @Override
@@ -76,6 +119,7 @@ public class MasconCart extends JavaPlugin implements Listener {
     private void handleSteerVehicle(PacketEvent event) {
         Player p = event.getPlayer();
         UUID id = p.getUniqueId();
+        if (masconDisabled.getOrDefault(id, false)) return;
         if (!p.isInsideVehicle()) {
             lastASide.remove(id);
             lastForward.remove(id);
@@ -103,6 +147,7 @@ public class MasconCart extends JavaPlugin implements Listener {
         boolean prevB = lastBackward.getOrDefault(id, false);
 
         if (aPressed && !prevA) {
+            if (!(p.getVehicle() instanceof Minecart)) return;
             long now = System.currentTimeMillis();
             long last = lastToggle.getOrDefault(id, 0L);
             if (now - last > TOGGLE_COOLDOWN_MS) {
@@ -112,13 +157,21 @@ public class MasconCart extends JavaPlugin implements Listener {
                 p.sendMessage("§a[Mascon] モード: " + (newMode ? "ON TC制御無効" : "OFF TC制御有効"));
                 if (newMode) {
                     notchLevel.put(id, 0);
-                    currentSpeed.put(id, 0.0);
+
                     Vehicle vehicle = (Vehicle) p.getVehicle();
                     MinecartGroup group = MinecartGroup.get(vehicle);
+
+                    double currentVel = 0.0;
+                    if (vehicle instanceof Minecart mc) {
+                        currentVel = mc.getVelocity().length();
+                    }
+                    currentSpeed.put(id, currentVel);
+
                     if (group != null) {
                         group.getProperties().setSpeedLimit(Double.MAX_VALUE);
                     }
-                } else {
+                }
+                     else {
                     notchLevel.remove(id);
                     currentSpeed.remove(id);
                     lastDirectionByPlayer.remove(id);
