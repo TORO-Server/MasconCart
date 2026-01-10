@@ -8,8 +8,7 @@ import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
-import net.md_5.bungee.api.ChatMessageType;
-import net.md_5.bungee.api.chat.TextComponent;
+import net.kyori.adventure.platform.bukkit.BukkitAudiences;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Minecart;
 import org.bukkit.entity.Player;
@@ -25,6 +24,7 @@ import com.bergerkiller.bukkit.tc.properties.standard.type.SignSkipOptions;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 public class MasconCart extends JavaPlugin implements Listener {
@@ -36,7 +36,7 @@ public class MasconCart extends JavaPlugin implements Listener {
     private static final double MAX_SPEED = 1.5;
     private static final double STOP_THRESHOLD_SPEED = 0.05;
 
-    private ProtocolManager protocolManager;
+    private BukkitAudiences adventure;
     private final Map<UUID, Boolean> masconDisabled = new HashMap<>();
 
     private final Map<UUID, Boolean> masconMode = new HashMap<>();
@@ -48,14 +48,14 @@ public class MasconCart extends JavaPlugin implements Listener {
     private final Map<UUID, Boolean> lastBackward = new HashMap<>();
     private final Map<UUID, Boolean> lastDSide = new HashMap<>();
     private final Map<UUID, Vector> lastDirectionByPlayer = new HashMap<>();
-    private final Map<String, Vector> lastDirectionByTrain = new HashMap<>();
     private final Map<UUID, Long> lastClickTime = new HashMap<>();
 
     private BukkitTask updateTask;
 
     @Override
     public void onEnable() {
-        protocolManager = ProtocolLibrary.getProtocolManager();
+        this.adventure = BukkitAudiences.create(this);
+        ProtocolManager protocolManager = ProtocolLibrary.getProtocolManager();
 
         protocolManager.addPacketListener(new PacketAdapter(this, PacketType.Play.Client.STEER_VEHICLE) {
             @Override
@@ -75,7 +75,7 @@ public class MasconCart extends JavaPlugin implements Listener {
             } catch (IllegalArgumentException ignored) {}
         }
 
-        getCommand("mascon").setExecutor((sender, command, label, args) -> {
+        Objects.requireNonNull(getCommand("mascon")).setExecutor((sender, command, label, args) -> {
             if (!(sender instanceof Player p)) {
                 sender.sendMessage("プレイヤーのみ使用できます");
                 return true;
@@ -112,6 +112,10 @@ public class MasconCart extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
+        if (this.adventure != null) {
+            this.adventure.close();
+            this.adventure = null;
+        }
         if (updateTask != null) updateTask.cancel();
         getLogger().info("MasconCart disabled");
     }
@@ -234,13 +238,11 @@ public class MasconCart extends JavaPlugin implements Listener {
         if (action != Action.RIGHT_CLICK_AIR && action != Action.RIGHT_CLICK_BLOCK) {
             return;
         }
-        if (action == Action.RIGHT_CLICK_BLOCK && event.getClickedBlock().getType().isInteractable()) {
+        if (action == Action.RIGHT_CLICK_BLOCK && Objects.requireNonNull(event.getClickedBlock()).getType().isInteractable()) {
             return;
         }
 
-        if (!(p.getVehicle() instanceof Vehicle)) return;
-        Vehicle vehicle = (Vehicle) p.getVehicle();
-        if (vehicle == null) return;
+        if (!(p.getVehicle() instanceof Vehicle vehicle)) return;
 
         MinecartGroup group = MinecartGroup.get(vehicle);
         if (group == null || group.isEmpty()) return;
@@ -295,9 +297,7 @@ public class MasconCart extends JavaPlugin implements Listener {
                 continue;
             }
 
-            if (!(p.getVehicle() instanceof Vehicle)) continue;
-            Vehicle vehicle = (Vehicle) p.getVehicle();
-            if (vehicle == null) continue;
+            if (!(p.getVehicle() instanceof Vehicle vehicle)) continue;
             MinecartGroup group = MinecartGroup.get(vehicle);
             if (group == null || group.isEmpty()) continue;
 
@@ -349,7 +349,7 @@ public class MasconCart extends JavaPlugin implements Listener {
 
             double speedKmH = current * 80;
             String actionBarMsg = "ノッチ: " + levelToLabel(level) + " 速度: " + String.format("%.1f", speedKmH) + " km/h";
-            p.spigot().sendMessage(ChatMessageType.ACTION_BAR, TextComponent.fromLegacyText(actionBarMsg));
+            adventure.player(p).sendActionBar(net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer.legacySection().deserialize(actionBarMsg));
         }
     }
 
@@ -379,7 +379,5 @@ public class MasconCart extends JavaPlugin implements Listener {
                 getLogger().warning(t.getMessage());
             }
         }
-
-        lastDirectionByTrain.put(group.getProperties().getTrainName(), forward.clone().normalize());
     }
 }
