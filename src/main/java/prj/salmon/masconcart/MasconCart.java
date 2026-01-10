@@ -238,6 +238,7 @@ public class MasconCart extends JavaPlugin implements Listener {
             return;
         }
 
+        if (!(p.getVehicle() instanceof Vehicle)) return;
         Vehicle vehicle = (Vehicle) p.getVehicle();
         if (vehicle == null) return;
 
@@ -294,6 +295,7 @@ public class MasconCart extends JavaPlugin implements Listener {
                 continue;
             }
 
+            if (!(p.getVehicle() instanceof Vehicle)) continue;
             Vehicle vehicle = (Vehicle) p.getVehicle();
             if (vehicle == null) continue;
             MinecartGroup group = MinecartGroup.get(vehicle);
