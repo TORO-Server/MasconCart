@@ -8,7 +8,8 @@ import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
-import net.kyori.adventure.platform.bukkit.BukkitAudiences;
+import net.md_5.bungee.api.ChatMessageType;
+import net.md_5.bungee.api.chat.TextComponent;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Minecart;
 import org.bukkit.entity.Player;
@@ -36,7 +37,7 @@ public class MasconCart extends JavaPlugin implements Listener {
     private static final double MAX_SPEED = 1.5;
     private static final double STOP_THRESHOLD_SPEED = 0.05;
 
-    private BukkitAudiences adventure;
+
     private final Map<UUID, Boolean> masconDisabled = new HashMap<>();
 
     private final Map<UUID, Boolean> masconMode = new HashMap<>();
@@ -54,7 +55,7 @@ public class MasconCart extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
-        this.adventure = BukkitAudiences.create(this);
+
         ProtocolManager protocolManager = ProtocolLibrary.getProtocolManager();
 
         protocolManager.addPacketListener(new PacketAdapter(this, PacketType.Play.Client.STEER_VEHICLE) {
@@ -112,10 +113,7 @@ public class MasconCart extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
-        if (this.adventure != null) {
-            this.adventure.close();
-            this.adventure = null;
-        }
+
         if (updateTask != null) updateTask.cancel();
         getLogger().info("MasconCart disabled");
     }
@@ -349,7 +347,7 @@ public class MasconCart extends JavaPlugin implements Listener {
 
             double speedKmH = current * 80;
             String actionBarMsg = "ノッチ: " + levelToLabel(level) + " 速度: " + String.format("%.1f", speedKmH) + " km/h";
-            adventure.player(p).sendActionBar(net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer.legacySection().deserialize(actionBarMsg));
+            p.spigot().sendMessage(ChatMessageType.ACTION_BAR, TextComponent.fromLegacyText(actionBarMsg));
         }
     }
 
