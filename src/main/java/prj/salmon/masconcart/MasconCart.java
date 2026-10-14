@@ -2,25 +2,26 @@ package prj.salmon.masconcart;
 
 import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
+import com.bergerkiller.bukkit.tc.controller.MinecartMemberStore;
+import com.bergerkiller.bukkit.tc.TrainCarts;
 import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolLibrary;
 import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketAdapter;
-import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundPlayerInputPacketHandle;
 import net.md_5.bungee.api.ChatMessageType;
 import net.md_5.bungee.api.chat.TextComponent;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Minecart;
 import org.bukkit.entity.Player;
-import org.bukkit.entity.Vehicle;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
-import org.bukkit.util.Vector;
 import com.bergerkiller.bukkit.tc.properties.standard.type.SignSkipOptions;
 
 import java.util.HashMap;
@@ -32,10 +33,8 @@ public class MasconCart extends JavaPlugin implements Listener {
 
     private static final long TOGGLE_COOLDOWN_MS = 1000;
     private static final long TICK_INTERVAL = 2L;
-    private static final double FRICTION_FACTOR = 0.995;
-    private static final double B_IMPULSE = 0.007;
-    private static final double MAX_SPEED = 1.5;
-    private static final double STOP_THRESHOLD_SPEED = 0.05;
+    private static final double MAX_SPEED = MasconMotionProfile.MAX_SPEED;
+    private static final double STOP_THRESHOLD_SPEED = 0.0025;
 
 
     private final Map<UUID, Boolean> masconDisabled = new HashMap<>();
@@ -43,12 +42,14 @@ public class MasconCart extends JavaPlugin implements Listener {
     private final Map<UUID, Boolean> masconMode = new HashMap<>();
     private final Map<UUID, Integer> notchLevel = new HashMap<>();
     private final Map<UUID, Double> currentSpeed = new HashMap<>();
+    private final Map<UUID, MasconMotionProfile> motionProfiles = new HashMap<>();
     private final Map<UUID, Long> lastToggle = new HashMap<>();
-    private final Map<UUID, Boolean> lastASide = new HashMap<>();
+    private final Map<UUID, Boolean> lastTogglePressed = new HashMap<>();
     private final Map<UUID, Boolean> lastForward = new HashMap<>();
     private final Map<UUID, Boolean> lastBackward = new HashMap<>();
-    private final Map<UUID, Boolean> lastDSide = new HashMap<>();
-    private final Map<UUID, Vector> lastDirectionByPlayer = new HashMap<>();
+    private final Map<UUID, Boolean> lastNeutralPressed = new HashMap<>();
+    private final Map<UUID, Boolean> lastJumpPressed = new HashMap<>();
+    private final Map<UUID, ControlledTrain> controlledTrains = new HashMap<>();
     private final Map<UUID, Long> lastClickTime = new HashMap<>();
 
     private BukkitTask updateTask;
@@ -58,7 +59,8 @@ public class MasconCart extends JavaPlugin implements Listener {
 
         ProtocolManager protocolManager = ProtocolLibrary.getProtocolManager();
 
-        protocolManager.addPacketListener(new PacketAdapter(this, PacketType.Play.Client.STEER_VEHICLE) {
+        protocolManager.addPacketListener(new PacketAdapter(PacketAdapter.params()
+                .plugin(this).types(PacketType.Play.Client.STEER_VEHICLE).optionSync()) {
             @Override
             public void onPacketReceiving(PacketEvent event) {
                 handleSteerVehicle(event);
@@ -87,6 +89,7 @@ public class MasconCart extends JavaPlugin implements Listener {
                 return true;
             }
             if (args[0].equalsIgnoreCase("off")) {
+                stopMascon(id);
                 masconDisabled.put(id, true);
                 updateConfigDisabledList();
                 p.sendMessage("§c[Mascon] このプレイヤーではMascon機能を無効化しました");
@@ -115,81 +118,86 @@ public class MasconCart extends JavaPlugin implements Listener {
     public void onDisable() {
 
         if (updateTask != null) updateTask.cancel();
+        for (UUID id : java.util.List.copyOf(controlledTrains.keySet())) stopMascon(id);
+        ProtocolLibrary.getProtocolManager().removePacketListeners(this);
         getLogger().info("MasconCart disabled");
     }
 
     private void handleSteerVehicle(PacketEvent event) {
         Player p = event.getPlayer();
         UUID id = p.getUniqueId();
-        if (masconDisabled.getOrDefault(id, false)) return;
         if (!p.isInsideVehicle()) {
-            lastASide.remove(id);
+            lastTogglePressed.remove(id);
             lastForward.remove(id);
             lastBackward.remove(id);
-            lastDSide.remove(id);
+            lastNeutralPressed.remove(id);
+            lastJumpPressed.remove(id);
             return;
         }
+        MinecartGroup group = getRiddenGroup(p);
+        if (group == null || group.isEmpty()) return;
 
-        PacketContainer packet = event.getPacket();
-        float sideways = 0f;
-        float forward = 0f;
-        try {
-            sideways = packet.getFloat().read(0);
-            forward = packet.getFloat().read(1);
-        } catch (Exception ignored) {}
+        // BKCommonLib handles both legacy float input and the 1.21.2+ Input record.
+        ServerboundPlayerInputPacketHandle input =
+                ServerboundPlayerInputPacketHandle.createHandle(event.getPacket().getHandle());
+        boolean togglePressed = input.isRight(); // D toggles mascon mode
+        boolean neutralPressed = input.isLeft();  // A selects neutral
+        boolean forwardPressed = input.isForward();
+        boolean backwardPressed = input.isBackward();
+        boolean jumpPressed = input.isJump();
 
-        boolean aPressed = sideways < -0.5f;
-        boolean dPressed = sideways > 0.5f;
-        boolean forwardPressed = forward > 0.5f;
-        boolean backwardPressed = forward < -0.5f;
-
-        boolean prevA = lastASide.getOrDefault(id, false);
-        boolean prevD = lastDSide.getOrDefault(id, false);
+        boolean prevToggle = lastTogglePressed.getOrDefault(id, false);
+        boolean prevNeutral = lastNeutralPressed.getOrDefault(id, false);
         boolean prevF = lastForward.getOrDefault(id, false);
         boolean prevB = lastBackward.getOrDefault(id, false);
+        boolean prevJump = lastJumpPressed.getOrDefault(id, false);
 
-        if (aPressed && !prevA) {
-            if (!(p.getVehicle() instanceof Minecart)) return;
+        if (!masconDisabled.getOrDefault(id, false) && togglePressed && !prevToggle) {
             long now = System.currentTimeMillis();
             long last = lastToggle.getOrDefault(id, 0L);
             if (now - last > TOGGLE_COOLDOWN_MS) {
                 boolean newMode = !masconMode.getOrDefault(id, false);
+                if (newMode && controlledTrains.values().stream().anyMatch(train -> train.group() == group)) {
+                    p.sendMessage("§c[Mascon] この列車は他のプレイヤーが操作中です");
+                    lastTogglePressed.put(id, true);
+                    return;
+                }
                 masconMode.put(id, newMode);
                 lastToggle.put(id, now);
                 p.sendMessage("§a[Mascon] モード: " + (newMode ? "ON TC制御無効" : "OFF TC制御有効"));
                 if (newMode) {
                     notchLevel.put(id, 0);
 
-                    Vehicle vehicle = (Vehicle) p.getVehicle();
-                    MinecartGroup group = MinecartGroup.get(vehicle);
-
-                    double currentVel = 0.0;
-                    if (vehicle instanceof Minecart mc) {
-                        currentVel = mc.getVelocity().length();
-                    }
-                    currentSpeed.put(id, currentVel);
-
-                    if (group != null) {
-                        group.getProperties().setSpeedLimit(Double.MAX_VALUE);
-                    }
+                    MasconMovementAction movementAction = new MasconMovementAction();
+                    controlledTrains.put(id, new ControlledTrain(group,
+                            group.getProperties().getSpeedLimit(), group.getProperties().getSkipOptions(),
+                            movementAction));
+                    currentSpeed.put(id, group.head().getForce());
+                    motionProfiles.put(id, new MasconMotionProfile());
+                    group.getActions().clear();
+                    group.getActions().addAction(movementAction);
+                    group.getProperties().setSpeedLimit(MAX_SPEED);
+                    group.getProperties().setManualMovementAllowed(false);
+                } else {
+                    stopMascon(id);
                 }
-                     else {
-                    notchLevel.remove(id);
-                    currentSpeed.remove(id);
-                    lastDirectionByPlayer.remove(id);
-                    Vehicle vehicle = (Vehicle) p.getVehicle();
-                    MinecartGroup group = MinecartGroup.get(vehicle);
-                    if (group != null) {
-                        group.getProperties().setSpeedLimit(0.4);
-                        group.getProperties().setSkipOptions(SignSkipOptions.NONE);
-                    }
-                }
+            }
+        }
+        if (jumpPressed && !prevJump) {
+            reverseIfStopped(p, group);
+        }
+        if (jumpPressed) event.setCancelled(true);
+        if (!masconMode.getOrDefault(id, false)) {
+            // Leave W input available for TrainCarts' normal passenger movement.
+            if (!controlledTrains.values().stream().anyMatch(train -> train.group() == group)) {
+                group.getProperties().setManualMovementAllowed(true);
             }
         }
         if (masconMode.getOrDefault(id, false)) {
             int level = notchLevel.getOrDefault(id, 0);
 
-            if (dPressed && !prevD) {
+            if (neutralPressed && !prevNeutral) {
+                level = 0;
                 notchLevel.put(id, 0);
             }
 
@@ -204,15 +212,51 @@ public class MasconCart extends JavaPlugin implements Listener {
                     notchLevel.put(id, level);
                 }
             }
-            if (dPressed || forwardPressed || backwardPressed) {
+            if (neutralPressed || forwardPressed || backwardPressed) {
                 event.setCancelled(true);
             }
         }
 
-        lastASide.put(id, aPressed);
-        lastDSide.put(id, dPressed);
+        lastTogglePressed.put(id, togglePressed);
+        lastNeutralPressed.put(id, neutralPressed);
         lastForward.put(id, forwardPressed);
         lastBackward.put(id, backwardPressed);
+        lastJumpPressed.put(id, jumpPressed);
+    }
+
+    private MinecartGroup getRiddenGroup(Player player) {
+        if (!(player.getVehicle() instanceof Minecart minecart)) return null;
+        MinecartMember<?> member = MinecartMemberStore.getFromEntity(minecart);
+        // Click-to-Minecart spawns Bukkit minecarts and marks them with this tag.
+        // Convert only these carts; respect TrainCarts' eligibility/world checks.
+        if (member == null && minecart.getScoreboardTags().contains("cminecart")) {
+            member = MinecartMemberStore.convert(TrainCarts.plugin, minecart);
+        }
+        return member == null || member.isUnloaded() ? null : member.getGroup();
+    }
+
+    private void reverseIfStopped(Player player, MinecartGroup group) {
+        UUID id = player.getUniqueId();
+        long now = System.currentTimeMillis();
+        if (now - lastClickTime.getOrDefault(id, 0L) < 500L) return;
+        lastClickTime.put(id, now);
+        if (controlledTrains.entrySet().stream().anyMatch(entry ->
+                !entry.getKey().equals(id) && entry.getValue().group() == group)) {
+            player.sendMessage("§c[Mascon] この列車は他のプレイヤーが操作中です");
+            return;
+        }
+        boolean moving = group.stream().anyMatch(member -> member.getForce() >= STOP_THRESHOLD_SPEED);
+        if (moving || currentSpeed.getOrDefault(id, 0.0) >= STOP_THRESHOLD_SPEED) {
+            player.sendMessage("§c[Mascon] 走行中は進行方向を切り替えられません");
+            return;
+        }
+        group.stop();
+        group.reverse();
+        if (masconMode.getOrDefault(id, false)) {
+            currentSpeed.put(id, 0.0);
+            motionProfiles.put(id, new MasconMotionProfile());
+        }
+        player.sendMessage("§b[Mascon] 進行方向を切り替えました");
     }
 
     @EventHandler
@@ -220,12 +264,6 @@ public class MasconCart extends JavaPlugin implements Listener {
         Player p = event.getPlayer();
         UUID id = p.getUniqueId();
 
-        long now = System.currentTimeMillis();
-        long cooldown = 500;
-        if (lastClickTime.containsKey(id) && now - lastClickTime.get(id) < cooldown) {
-            return;
-        }
-        lastClickTime.put(id, now);
         if (!p.isInsideVehicle() ||
                 !masconMode.getOrDefault(id, false) ||
                 !p.getInventory().getItemInMainHand().getType().isAir())
@@ -240,41 +278,10 @@ public class MasconCart extends JavaPlugin implements Listener {
             return;
         }
 
-        if (!(p.getVehicle() instanceof Vehicle vehicle)) return;
-
-        MinecartGroup group = MinecartGroup.get(vehicle);
+        MinecartGroup group = getRiddenGroup(p);
         if (group == null || group.isEmpty()) return;
-
-        MinecartMember<?> leader = group.get(0);
-        org.bukkit.entity.Entity ent = leader.getEntity().getEntity();
-        if (!(ent instanceof Minecart mc)) return;
-
-        double currentHorizontalSpeed = Math.sqrt(mc.getVelocity().getX() * mc.getVelocity().getX() + mc.getVelocity().getZ() * mc.getVelocity().getZ());
-
-        if (currentHorizontalSpeed < STOP_THRESHOLD_SPEED) {
-            for (MinecartMember<?> member : group) {
-                try {
-                    org.bukkit.entity.Entity memberEnt = member.getEntity().getEntity();
-                    if (!(memberEnt instanceof Minecart memberMc)) continue;
-
-                    Vector vel = memberMc.getVelocity();
-                    memberMc.setVelocity(new Vector(-vel.getX(), vel.getY(), -vel.getZ()));
-                } catch (Throwable t) {
-                    getLogger().warning(t.getMessage());
-                }
-            }
-
-            currentSpeed.put(id, currentHorizontalSpeed);
-
-            Vector lastDir = lastDirectionByPlayer.getOrDefault(id, new Vector(1, 0, 0));
-            lastDirectionByPlayer.put(id, lastDir.multiply(-1));
-
-            p.sendMessage("§b[Mascon] 進行方向を切り替えました");
-            event.setCancelled(true);
-        } else {
-            p.sendMessage("§c[Mascon] 走行中は進行方向を切り替えられません");
-            event.setCancelled(true);
-        }
+        reverseIfStopped(p, group);
+        event.setCancelled(true);
     }
 
     private String levelToLabel(int level) {
@@ -284,98 +291,88 @@ public class MasconCart extends JavaPlugin implements Listener {
         return "B" + Math.abs(level);
     }
 
+    private record ControlledTrain(MinecartGroup group, double speedLimit, SignSkipOptions skipOptions,
+                                   MasconMovementAction movementAction) {}
+
+    private void stopMascon(UUID id) {
+        ControlledTrain train = controlledTrains.remove(id);
+        if (train != null) train.movementAction().release();
+        if (train != null && !train.group().isRemoved()) {
+            if (train.group().getActions().getCurrentAction() == train.movementAction()) {
+                train.group().getActions().removeAction();
+            }
+            train.group().getProperties().setSpeedLimit(train.speedLimit());
+            train.group().getProperties().setSkipOptions(train.skipOptions());
+            train.group().getProperties().setManualMovementAllowed(true);
+        }
+        masconMode.remove(id);
+        notchLevel.remove(id);
+        currentSpeed.remove(id);
+        motionProfiles.remove(id);
+        lastTogglePressed.remove(id);
+        lastNeutralPressed.remove(id);
+        lastForward.remove(id);
+        lastBackward.remove(id);
+        lastJumpPressed.remove(id);
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        UUID id = event.getPlayer().getUniqueId();
+        stopMascon(id);
+        lastToggle.remove(id);
+        lastClickTime.remove(id);
+    }
+
     private void tickUpdate() {
         for (Player p : Bukkit.getOnlinePlayers()) {
             UUID id = p.getUniqueId();
 
             if (!p.isInsideVehicle()) {
-                masconMode.remove(id);
-                notchLevel.remove(id);
-                currentSpeed.remove(id);
+                stopMascon(id);
                 continue;
             }
 
-            if (!(p.getVehicle() instanceof Vehicle vehicle)) continue;
-            MinecartGroup group = MinecartGroup.get(vehicle);
+            MinecartGroup group = getRiddenGroup(p);
+            ControlledTrain controlled = controlledTrains.get(id);
+            if (controlled != null && controlled.group() != group) stopMascon(id);
             if (group == null || group.isEmpty()) continue;
 
             boolean masconOn = masconMode.getOrDefault(id, false);
 
             if (masconOn) {
-                group.getProperties().setSkipOptions(SignSkipOptions.create(0, 9999, ""));
-                group.getProperties().setSpeedLimit(Double.MAX_VALUE);
-            } else {
-                group.getProperties().setSkipOptions(SignSkipOptions.NONE);
-                if (group.getProperties().getSpeedLimit() == Double.MAX_VALUE) {
-                    group.getProperties().setSpeedLimit(0.4);
+                // A movement-controlling action makes powered rails skip both boosting and braking.
+                if (controlled != null && group.getActions().getCurrentAction() != controlled.movementAction()) {
+                    group.getActions().clear();
+                    group.getActions().addAction(controlled.movementAction());
                 }
-                group.getProperties().setManualMovementAllowed(true);
+                group.getProperties().setSkipOptions(SignSkipOptions.create(0, 9999, ""));
+                group.getProperties().setSpeedLimit(MAX_SPEED);
             }
 
             if (!masconOn) {
+                if (controlledTrains.values().stream().noneMatch(train -> train.group() == group)) {
+                    group.getProperties().setManualMovementAllowed(true);
+                }
                 continue;
             }
 
             int level = notchLevel.getOrDefault(id, 0);
             double current = currentSpeed.getOrDefault(id, 0.0);
-            double targetSpeed;
-
-            if (level > 0) {
-                targetSpeed = (MAX_SPEED / 7.0) * level;
-                double accel = 0.02;
-                if (current < targetSpeed) current = Math.min(current + accel, targetSpeed);
-                else current *= FRICTION_FACTOR;
-            } else if (level < 0) {
-                if (level == -8) current = 0.0;
-                else current -= B_IMPULSE * Math.abs(level);
-            } else {
-                current *= FRICTION_FACTOR;
-            }
-
-            current = Math.max(0.0, Math.min(current, MAX_SPEED));
+            MasconMotionProfile profile = motionProfiles.computeIfAbsent(id, key -> new MasconMotionProfile());
+            current = profile.update(current, level, TICK_INTERVAL / 20.0);
             currentSpeed.put(id, current);
 
-            Vector direction = lastDirectionByPlayer.getOrDefault(id, new Vector(1, 0, 0));
-            applySpeedToGroup(group, current, direction);
+            applySpeedToGroup(group, current);
 
-            MinecartMember<?> leader = group.get(0);
-            org.bukkit.entity.Entity ent = leader.getEntity().getEntity();
-            if (ent instanceof Minecart mc) {
-                Vector vel = mc.getVelocity().clone().setY(0);
-                if (vel.lengthSquared() > 1e-6) lastDirectionByPlayer.put(id, vel.normalize());
-            }
-
-            double speedKmH = current * 80;
+            double speedKmH = current * MasconMotionProfile.DISPLAY_KMH_PER_SPEED;
             String actionBarMsg = "ノッチ: " + levelToLabel(level) + " 速度: " + String.format("%.1f", speedKmH) + " km/h";
             p.spigot().sendMessage(ChatMessageType.ACTION_BAR, TextComponent.fromLegacyText(actionBarMsg));
         }
     }
 
-    private void applySpeedToGroup(MinecartGroup group, double speed, Vector playerDirection) {
-        MinecartMember<?> leader = group.get(0);
-        org.bukkit.entity.Entity leaderEnt = leader.getEntity().getEntity();
-        if (!(leaderEnt instanceof Minecart mcLeader)) return;
-
-        Vector forward = mcLeader.getVelocity().clone();
-        forward.setY(0);
-        if (forward.lengthSquared() < 1e-6) {
-            forward = playerDirection.clone().setY(0);
-        }
-
-        forward.normalize().multiply(speed);
-
-        for (MinecartMember<?> member : group) {
-            try {
-                org.bukkit.entity.Entity ent = member.getEntity().getEntity();
-                if (!(ent instanceof Minecart mc)) continue;
-
-                Vector vel = forward.clone();
-                vel.setY(mc.getVelocity().getY());
-                mc.setVelocity(vel);
-
-            } catch (Throwable t) {
-                getLogger().warning(t.getMessage());
-            }
-        }
+    private void applySpeedToGroup(MinecartGroup group, double speed) {
+        // TrainCarts applies force along each cart's rail direction, including at rest.
+        group.setForwardForce(speed);
     }
 }
