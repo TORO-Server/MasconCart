@@ -4,6 +4,9 @@ import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.controller.MinecartMemberStore;
 import com.bergerkiller.bukkit.tc.TrainCarts;
+import com.bergerkiller.bukkit.tc.properties.CartPropertiesStore;
+import com.bergerkiller.bukkit.common.controller.DefaultEntityController;
+import com.bergerkiller.bukkit.common.controller.DefaultEntityNetworkController;
 import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolLibrary;
 import com.comphenix.protocol.ProtocolManager;
@@ -134,8 +137,8 @@ public class MasconCart extends JavaPlugin implements Listener {
             lastJumpPressed.remove(id);
             return;
         }
-        MinecartGroup group = getRiddenGroup(p);
-        if (group == null || group.isEmpty()) return;
+        if (!(p.getVehicle() instanceof Minecart)) return;
+        MinecartGroup group = getRiddenGroup(p, false);
 
         // BKCommonLib handles both legacy float input and the 1.21.2+ Input record.
         ServerboundPlayerInputPacketHandle input =
@@ -157,7 +160,13 @@ public class MasconCart extends JavaPlugin implements Listener {
             long last = lastToggle.getOrDefault(id, 0L);
             if (now - last > TOGGLE_COOLDOWN_MS) {
                 boolean newMode = !masconMode.getOrDefault(id, false);
-                if (newMode && controlledTrains.values().stream().anyMatch(train -> train.group() == group)) {
+                if (newMode) group = getRiddenGroup(p, true);
+                if (newMode && (group == null || group.isEmpty())) {
+                    p.sendMessage("§c[Mascon] このトロッコではマスコンを開始できません");
+                    lastTogglePressed.put(id, true);
+                    return;
+                }
+                if (newMode && isControlled(group)) {
                     p.sendMessage("§c[Mascon] この列車は他のプレイヤーが操作中です");
                     lastTogglePressed.put(id, true);
                     return;
@@ -180,18 +189,16 @@ public class MasconCart extends JavaPlugin implements Listener {
                     group.getProperties().setManualMovementAllowed(false);
                 } else {
                     stopMascon(id);
+                    group = null;
                 }
             }
         }
-        if (jumpPressed && !prevJump) {
+        if (masconMode.getOrDefault(id, false) && group != null && jumpPressed && !prevJump) {
             reverseIfStopped(p, group);
         }
-        if (jumpPressed) event.setCancelled(true);
         if (!masconMode.getOrDefault(id, false)) {
-            // Leave W input available for TrainCarts' normal passenger movement.
-            if (!controlledTrains.values().stream().anyMatch(train -> train.group() == group)) {
-                group.getProperties().setManualMovementAllowed(true);
-            }
+            // No packet cancellation or synthetic movement while OFF.
+            if (group != null && !isControlled(group)) restoreVanilla(group);
         }
         if (masconMode.getOrDefault(id, false)) {
             int level = notchLevel.getOrDefault(id, 0);
@@ -212,7 +219,7 @@ public class MasconCart extends JavaPlugin implements Listener {
                     notchLevel.put(id, level);
                 }
             }
-            if (neutralPressed || forwardPressed || backwardPressed) {
+            if (neutralPressed || forwardPressed || backwardPressed || jumpPressed) {
                 event.setCancelled(true);
             }
         }
@@ -224,15 +231,34 @@ public class MasconCart extends JavaPlugin implements Listener {
         lastJumpPressed.put(id, jumpPressed);
     }
 
-    private MinecartGroup getRiddenGroup(Player player) {
+    private boolean isControlled(MinecartGroup group) {
+        return controlledTrains.values().stream().anyMatch(train -> train.group() == group);
+    }
+
+    private MinecartGroup getRiddenGroup(Player player, boolean convert) {
         if (!(player.getVehicle() instanceof Minecart minecart)) return null;
         MinecartMember<?> member = MinecartMemberStore.getFromEntity(minecart);
-        // Click-to-Minecart spawns Bukkit minecarts and marks them with this tag.
-        // Convert only these carts; respect TrainCarts' eligibility/world checks.
-        if (member == null && minecart.getScoreboardTags().contains("cminecart")) {
+        // Conversion is requested only when enabling mascon, never by OFF-mode polling.
+        if (member == null && convert) {
             member = MinecartMemberStore.convert(TrainCarts.plugin, minecart);
         }
         return member == null || member.isUnloaded() ? null : member.getGroup();
+    }
+
+    private void restoreVanilla(MinecartGroup group) {
+        // Snapshot because clearGroup removes members from the group during iteration.
+        for (MinecartMember<?> member : java.util.List.copyOf(group)) {
+            var entity = member.getEntity();
+            var minecart = entity.getEntity();
+            // Detach TrainCarts models/network tracking before removing group membership.
+            entity.setNetworkController(new DefaultEntityNetworkController());
+            member.clearGroup();
+            member.setUnloaded(true);
+            CartPropertiesStore.remove(minecart.getUniqueId());
+            entity.setController(new DefaultEntityController());
+            // TrainCarts changes this during physics; restore Bukkit's vanilla default.
+            minecart.setMaxSpeed(0.4);
+        }
     }
 
     private void reverseIfStopped(Player player, MinecartGroup group) {
@@ -278,7 +304,7 @@ public class MasconCart extends JavaPlugin implements Listener {
             return;
         }
 
-        MinecartGroup group = getRiddenGroup(p);
+        MinecartGroup group = getRiddenGroup(p, false);
         if (group == null || group.isEmpty()) return;
         reverseIfStopped(p, group);
         event.setCancelled(true);
@@ -303,7 +329,7 @@ public class MasconCart extends JavaPlugin implements Listener {
             }
             train.group().getProperties().setSpeedLimit(train.speedLimit());
             train.group().getProperties().setSkipOptions(train.skipOptions());
-            train.group().getProperties().setManualMovementAllowed(true);
+            restoreVanilla(train.group());
         }
         masconMode.remove(id);
         notchLevel.remove(id);
@@ -333,7 +359,7 @@ public class MasconCart extends JavaPlugin implements Listener {
                 continue;
             }
 
-            MinecartGroup group = getRiddenGroup(p);
+            MinecartGroup group = getRiddenGroup(p, false);
             ControlledTrain controlled = controlledTrains.get(id);
             if (controlled != null && controlled.group() != group) stopMascon(id);
             if (group == null || group.isEmpty()) continue;
@@ -351,9 +377,7 @@ public class MasconCart extends JavaPlugin implements Listener {
             }
 
             if (!masconOn) {
-                if (controlledTrains.values().stream().noneMatch(train -> train.group() == group)) {
-                    group.getProperties().setManualMovementAllowed(true);
-                }
+                if (!isControlled(group)) restoreVanilla(group);
                 continue;
             }
 
