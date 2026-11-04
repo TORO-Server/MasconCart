@@ -7,3 +7,9 @@ commands:
   mascon:
     description: Mascon機能を有効/無効にします
     usage: /mascon <on|off>
+    permission: masconcart.use
+    permission-message: 権限がありません
+permissions:
+  masconcart.use:
+    description: /mascon とDキーでのマスコンモード切り替えを許可します
+    default: true
