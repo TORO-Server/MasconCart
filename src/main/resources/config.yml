@@ -1,1 +1,8 @@
 disabledPlayers: []
+# マスコンで操作できるTrainCartsの列車の設定
+takeover:
+  # true: 下のタグが付いた列車だけ操作できます。Click-to-Minecartのトロッコと、TrainCartsに変換されていない普通のトロッコは、タグがなくても操作できます
+  # false: 乗っている列車をどれでも操作できます
+  requireTag: false
+  # 操作できる列車に付けるTrainCartsのタグ (/train tags add mascon)
+  tag: mascon

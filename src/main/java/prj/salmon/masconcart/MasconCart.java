@@ -38,7 +38,7 @@ public class MasconCart extends JavaPlugin implements Listener {
     private static final long TICK_INTERVAL = 2L;
     private static final double MAX_SPEED = MasconMotionProfile.MAX_SPEED;
     private static final double STOP_THRESHOLD_SPEED = 0.0025;
-
+    private static final String USE_PERMISSION = "masconcart.use";
 
     private final Map<UUID, Boolean> masconDisabled = new HashMap<>();
 
@@ -56,9 +56,16 @@ public class MasconCart extends JavaPlugin implements Listener {
     private final Map<UUID, Long> lastClickTime = new HashMap<>();
 
     private BukkitTask updateTask;
+    private MasconTrainPolicy trainPolicy;
 
     @Override
     public void onEnable() {
+
+        saveDefaultConfig();
+        // A config written by an older version has no takeover section, so these defaults must keep today's driving.
+        trainPolicy = new MasconTrainPolicy(
+                getConfig().getBoolean("takeover.requireTag", false),
+                getConfig().getString("takeover.tag", MasconTrainPolicy.DEFAULT_TAKEOVER_TAG));
 
         ProtocolManager protocolManager = ProtocolLibrary.getProtocolManager();
 
@@ -74,7 +81,6 @@ public class MasconCart extends JavaPlugin implements Listener {
         updateTask = Bukkit.getScheduler().runTaskTimer(this, this::tickUpdate, 0L, TICK_INTERVAL);
         getLogger().info("MasconCart enabled (prj.salmon.masconcart)");
 
-        saveDefaultConfig();
         for (String uuidStr : getConfig().getStringList("disabledPlayers")) {
             try {
                 masconDisabled.put(UUID.fromString(uuidStr), true);
@@ -155,7 +161,7 @@ public class MasconCart extends JavaPlugin implements Listener {
         boolean prevB = lastBackward.getOrDefault(id, false);
         boolean prevJump = lastJumpPressed.getOrDefault(id, false);
 
-        if (!masconDisabled.getOrDefault(id, false) && togglePressed && !prevToggle) {
+        if (!masconDisabled.getOrDefault(id, false) && togglePressed && !prevToggle && p.hasPermission(USE_PERMISSION)) {
             long now = System.currentTimeMillis();
             long last = lastToggle.getOrDefault(id, 0L);
             if (now - last > TOGGLE_COOLDOWN_MS) {
@@ -171,6 +177,11 @@ public class MasconCart extends JavaPlugin implements Listener {
                     lastTogglePressed.put(id, true);
                     return;
                 }
+                if (newMode && !canTakeOver(group)) {
+                    p.sendMessage("§c[Mascon] この列車はマスコンで操作できません");
+                    lastTogglePressed.put(id, true);
+                    return;
+                }
                 masconMode.put(id, newMode);
                 lastToggle.put(id, now);
                 p.sendMessage("§a[Mascon] モード: " + (newMode ? "ON TC制御無効" : "OFF TC制御有効"));
@@ -180,7 +191,7 @@ public class MasconCart extends JavaPlugin implements Listener {
                     MasconMovementAction movementAction = new MasconMovementAction();
                     controlledTrains.put(id, new ControlledTrain(group,
                             group.getProperties().getSpeedLimit(), group.getProperties().getSkipOptions(),
-                            movementAction));
+                            group.getProperties().isManualMovementAllowed(), movementAction));
                     currentSpeed.put(id, group.head().getForce());
                     motionProfiles.put(id, new MasconMotionProfile());
                     group.getActions().clear();
@@ -198,7 +209,7 @@ public class MasconCart extends JavaPlugin implements Listener {
         }
         if (!masconMode.getOrDefault(id, false)) {
             // No packet cancellation or synthetic movement while OFF.
-            if (group != null && !isControlled(group)) restoreVanilla(group);
+            if (group != null && !isControlled(group)) restorePlayerCarts(group);
         }
         if (masconMode.getOrDefault(id, false)) {
             int level = notchLevel.getOrDefault(id, 0);
@@ -241,24 +252,41 @@ public class MasconCart extends JavaPlugin implements Listener {
         // Conversion is requested only when enabling mascon, never by OFF-mode polling.
         if (member == null && convert) {
             member = MinecartMemberStore.convert(TrainCarts.plugin, minecart);
+            // Kept on the entity so that a restart cannot turn this cart into something that looks like a TrainCarts train.
+            if (member != null) minecart.addScoreboardTag(MasconTrainPolicy.CONVERTED_TAG);
         }
         return member == null || member.isUnloaded() ? null : member.getGroup();
     }
 
-    private void restoreVanilla(MinecartGroup group) {
+    private boolean isPlayerCart(MinecartMember<?> member) {
+        var entity = member.getEntity();
+        return entity != null && MasconTrainPolicy.isPlayerCart(entity.getEntity().getScoreboardTags());
+    }
+
+    private boolean canTakeOver(MinecartGroup group) {
+        return trainPolicy.allowsTakeover(group.stream().allMatch(this::isPlayerCart), group.getProperties().getTags());
+    }
+
+    /** TrainCarts trains keep their group and properties; a player cart linked to one leaves it on its own. */
+    private void restorePlayerCarts(MinecartGroup group) {
         // Snapshot because clearGroup removes members from the group during iteration.
         for (MinecartMember<?> member : java.util.List.copyOf(group)) {
-            var entity = member.getEntity();
-            var minecart = entity.getEntity();
-            // Detach TrainCarts models/network tracking before removing group membership.
-            entity.setNetworkController(new DefaultEntityNetworkController());
-            member.clearGroup();
-            member.setUnloaded(true);
-            CartPropertiesStore.remove(minecart.getUniqueId());
-            entity.setController(new DefaultEntityController());
-            // TrainCarts changes this during physics; restore Bukkit's vanilla default.
-            minecart.setMaxSpeed(0.4);
+            if (isPlayerCart(member)) restoreVanilla(member);
         }
+    }
+
+    private void restoreVanilla(MinecartMember<?> member) {
+        var entity = member.getEntity();
+        var minecart = entity.getEntity();
+        minecart.removeScoreboardTag(MasconTrainPolicy.CONVERTED_TAG);
+        // Detach TrainCarts models/network tracking before removing group membership.
+        entity.setNetworkController(new DefaultEntityNetworkController());
+        member.clearGroup();
+        member.setUnloaded(true);
+        CartPropertiesStore.remove(minecart.getUniqueId());
+        entity.setController(new DefaultEntityController());
+        // TrainCarts changes this during physics; restore Bukkit's vanilla default.
+        minecart.setMaxSpeed(0.4);
     }
 
     private void reverseIfStopped(Player player, MinecartGroup group) {
@@ -318,7 +346,7 @@ public class MasconCart extends JavaPlugin implements Listener {
     }
 
     private record ControlledTrain(MinecartGroup group, double speedLimit, SignSkipOptions skipOptions,
-                                   MasconMovementAction movementAction) {}
+                                   boolean manualMovementAllowed, MasconMovementAction movementAction) {}
 
     private void stopMascon(UUID id) {
         ControlledTrain train = controlledTrains.remove(id);
@@ -329,7 +357,8 @@ public class MasconCart extends JavaPlugin implements Listener {
             }
             train.group().getProperties().setSpeedLimit(train.speedLimit());
             train.group().getProperties().setSkipOptions(train.skipOptions());
-            restoreVanilla(train.group());
+            train.group().getProperties().setManualMovementAllowed(train.manualMovementAllowed());
+            restorePlayerCarts(train.group());
         }
         masconMode.remove(id);
         notchLevel.remove(id);
@@ -366,6 +395,12 @@ public class MasconCart extends JavaPlugin implements Listener {
 
             boolean masconOn = masconMode.getOrDefault(id, false);
 
+            // The permission can be taken away while driving.
+            if (masconOn && !p.hasPermission(USE_PERMISSION)) {
+                stopMascon(id);
+                continue;
+            }
+
             if (masconOn) {
                 // A movement-controlling action makes powered rails skip both boosting and braking.
                 if (controlled != null && group.getActions().getCurrentAction() != controlled.movementAction()) {
@@ -377,7 +412,7 @@ public class MasconCart extends JavaPlugin implements Listener {
             }
 
             if (!masconOn) {
-                if (!isControlled(group)) restoreVanilla(group);
+                if (!isControlled(group)) restorePlayerCarts(group);
                 continue;
             }
 
